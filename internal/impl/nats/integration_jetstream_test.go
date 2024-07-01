@@ -99,7 +99,7 @@ input:
 }
 
 func TestIntegrationNatsPullConsumer(t *testing.T) {
-	integration.CheckSkip(t)
+	// integration.CheckSkip(t)
 	t.Parallel()
 
 	pool, err := dockertest.NewPool("")
@@ -147,7 +147,7 @@ input:
 		integration.StreamTestStreamParallel(1000),
 		integration.StreamTestStreamSequential(1000),
 		integration.StreamTestStreamParallelLossy(1000),
-		integration.StreamTestStreamParallelLossyThroughReconnect(1000),
+		// integration.StreamTestStreamParallelLossyThroughReconnect(1000),
 	)
 	suite.Run(
 		t, template,

@@ -98,14 +98,14 @@ xref:configuration:interpolation.adoc#bloblang-queries[function interpolation].
 }
 
 func init() {
-	err := service.RegisterInput(
+	err := service.RegisterBatchInput(
 		"nats_jetstream", natsJetStreamInputConfig(),
-		func(conf *service.ParsedConfig, mgr *service.Resources) (service.Input, error) {
+		func(conf *service.ParsedConfig, mgr *service.Resources) (service.BatchInput, error) {
 			input, err := newJetStreamReaderFromConfig(conf, mgr)
 			if err != nil {
 				return nil, err
 			}
-			return conf.WrapInputExtractTracingSpanMapping("nats_jetstream", input)
+			return conf.WrapBatchInputExtractTracingSpanMapping("nats_jetstream", input)
 		})
 	if err != nil {
 		panic(err)
@@ -321,7 +321,24 @@ func (j *jetStreamReader) disconnect() {
 	}
 }
 
-func (j *jetStreamReader) Read(ctx context.Context) (*service.Message, service.AckFunc, error) {
+// Read a message batch from a source, along with a function to be called
+// once the entire batch can be either acked (successfully sent or
+// intentionally filtered) or nacked (failed to be processed or dispatched
+// to the output).
+//
+// The AckFunc will be called for every message batch at least once, but
+// there are no guarantees as to when this will occur. If your input
+// implementation doesn't have a specific mechanism for dealing with a nack
+// then you can wrap your input implementation with AutoRetryNacksBatched to
+// get automatic retries.
+//
+// If this method returns ErrNotConnected then ReadBatch will not be called
+// again until Connect has returned a nil error. If ErrEndOfInput is
+// returned then Read will no longer be called and the pipeline will
+// gracefully terminate.
+
+// func (j *jetStreamReader) Read(ctx context.Context) (*service.Message, service.AckFunc, error) {
+func (j *jetStreamReader) ReadBatch(ctx context.Context) (service.MessageBatch, service.AckFunc, error) {
 	j.connMut.Lock()
 	natsSub := j.natsSub
 	j.connMut.Unlock()
@@ -335,29 +352,46 @@ func (j *jetStreamReader) Read(ctx context.Context) (*service.Message, service.A
 			// TODO: Any errors need capturing here to signal a lost connection?
 			return nil, nil, err
 		}
-		return convertMessage(nmsg)
+
+		msg := convertMessageBatch(nmsg)
+		return service.MessageBatch{msg}, func(ctx context.Context, err error) error {
+			if err != nil {
+				nmsg.Ack()
+			}
+			return nil
+		}, nil
 	}
 
-	for {
-		msgs, err := natsSub.Fetch(1, nats.Context(ctx))
-		if err != nil {
-			if errors.Is(err, nats.ErrTimeout) || errors.Is(err, context.DeadlineExceeded) {
-				// NATS enforces its own context that might time out faster than the original context
-				// Let's check if it was the original context that timed out
-				select {
-				case <-ctx.Done():
-					return nil, nil, ctx.Err()
-				default:
-					continue
-				}
+	msgs, err := natsSub.FetchBatch(10, nats.Context(ctx))
+	if err != nil {
+		if errors.Is(err, nats.ErrTimeout) || errors.Is(err, context.DeadlineExceeded) {
+			// NATS enforces its own context that might time out faster than the original context
+			// Let's check if it was the original context that timed out
+			select {
+			case <-ctx.Done():
+				return nil, nil, ctx.Err()
 			}
-			return nil, nil, err
 		}
-		if len(msgs) == 0 {
-			continue
-		}
-		return convertMessage(msgs[0])
+		return nil, nil, err
 	}
+
+	var batch []*nats.Msg
+	var benthosBatch []*service.Message
+
+	for m := range msgs.Messages() {
+		msg := convertMessageBatch(m)
+		benthosBatch = append(benthosBatch, msg)
+	}
+
+	return benthosBatch, func(ctx context.Context, err error) error {
+		if err != nil {
+			for _, v := range batch {
+				v.Ack()
+			}
+
+		}
+		return nil
+	}, nil
 }
 
 func (j *jetStreamReader) Close(ctx context.Context) error {
@@ -371,6 +405,30 @@ func (j *jetStreamReader) Close(ctx context.Context) error {
 		return ctx.Err()
 	}
 	return nil
+}
+
+func convertMessageBatch(m *nats.Msg) *service.Message {
+	msg := service.NewMessage(m.Data)
+	msg.MetaSet("nats_subject", m.Subject)
+
+	metadata, err := m.Metadata()
+	if err == nil {
+		msg.MetaSet("nats_sequence_stream", strconv.Itoa(int(metadata.Sequence.Stream)))
+		msg.MetaSet("nats_sequence_consumer", strconv.Itoa(int(metadata.Sequence.Consumer)))
+		msg.MetaSet("nats_num_delivered", strconv.Itoa(int(metadata.NumDelivered)))
+		msg.MetaSet("nats_num_pending", strconv.Itoa(int(metadata.NumPending)))
+		msg.MetaSet("nats_domain", metadata.Domain)
+		msg.MetaSet("nats_timestamp_unix_nano", strconv.Itoa(int(metadata.Timestamp.UnixNano())))
+	}
+
+	for k := range m.Header {
+		v := m.Header.Get(k)
+		if v != "" {
+			msg.MetaSet(k, v)
+		}
+	}
+
+	return msg
 }
 
 func convertMessage(m *nats.Msg) (*service.Message, service.AckFunc, error) {
