@@ -349,7 +349,7 @@ func (j *jetStreamReader) ReadBatch(ctx context.Context) (service.MessageBatch, 
 			return nil, nil, err
 		}
 
-		return service.MessageBatch{convertMessageBatch(nmsg)}, func(ctx context.Context, err error) error {
+		return service.MessageBatch{convertMessage(nmsg)}, func(ctx context.Context, err error) error {
 			if err != nil {
 				return nmsg.Nak()
 			}
@@ -357,43 +357,50 @@ func (j *jetStreamReader) ReadBatch(ctx context.Context) (service.MessageBatch, 
 		}, nil
 	}
 
-	msgs, err := natsSub.FetchBatch(1000, nats.Context(ctx))
-	msgs.Error()
-
-	if err != nil {
-		if errors.Is(err, nats.ErrTimeout) || errors.Is(err, context.DeadlineExceeded) {
-			// NATS enforces its own context that might time out faster than the original context
-			// Let's check if it was the original context that timed out
-			select {
-			case <-ctx.Done():
-				return nil, nil, ctx.Err()
-			}
-		}
-		return nil, nil, err
-	}
-
-	var batch []*nats.Msg
-	var benthosBatch []*service.Message
-
-	for m := range msgs.Messages() {
-		msg := convertMessageBatch(m).
-			WithContext(ctx)
-		benthosBatch = append(benthosBatch, msg)
-	}
-
-	return benthosBatch, func(ctx context.Context, err error) error {
+	var buf = make([]*service.Message, 1000)
+	for {
+		msgs, err := natsSub.Fetch(1000, nats.Context(ctx))
 		if err != nil {
-			for _, v := range batch {
-				v.Nak()
+			if errors.Is(err, nats.ErrTimeout) || errors.Is(err, context.DeadlineExceeded) {
+				// NATS enforces its own context that might time out faster than the original context
+				// Let's check if it was the original context that timed out
+				select {
+				case <-ctx.Done():
+					return nil, nil, ctx.Err()
+				default:
+					continue
+				}
+			}
+			return nil, nil, err
+		}
+		if len(msgs) == 0 {
+			continue
+		}
+
+		for i, m := range msgs {
+			msg := convertMessage(m).
+				WithContext(ctx)
+			buf[i] = msg
+		}
+
+		return buf[:len(msgs)], func(ctx context.Context, err error) error {
+			if err != nil {
+				for _, v := range msgs {
+					if err = v.Nak(); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
+
+			for _, v := range msgs {
+				if err = v.Ack(); err != nil {
+					return err
+				}
 			}
 			return nil
-		}
-
-		for _, v := range batch {
-			v.Ack()
-		}
-		return nil
-	}, nil
+		}, nil
+	}
 }
 
 func (j *jetStreamReader) Close(ctx context.Context) error {
@@ -409,7 +416,7 @@ func (j *jetStreamReader) Close(ctx context.Context) error {
 	return nil
 }
 
-func convertMessageBatch(m *nats.Msg) *service.Message {
+func convertMessage(m *nats.Msg) *service.Message {
 	msg := service.NewMessage(m.Data)
 	msg.MetaSet("nats_subject", m.Subject)
 
