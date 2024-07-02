@@ -22,10 +22,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nats-io/nats.go"
-
 	"github.com/Jeffail/shutdown"
-
+	"github.com/nats-io/nats.go"
 	"github.com/redpanda-data/benthos/v4/public/service"
 )
 
@@ -336,8 +334,6 @@ func (j *jetStreamReader) disconnect() {
 // again until Connect has returned a nil error. If ErrEndOfInput is
 // returned then Read will no longer be called and the pipeline will
 // gracefully terminate.
-
-// func (j *jetStreamReader) Read(ctx context.Context) (*service.Message, service.AckFunc, error) {
 func (j *jetStreamReader) ReadBatch(ctx context.Context) (service.MessageBatch, service.AckFunc, error) {
 	j.connMut.Lock()
 	natsSub := j.natsSub
@@ -353,16 +349,17 @@ func (j *jetStreamReader) ReadBatch(ctx context.Context) (service.MessageBatch, 
 			return nil, nil, err
 		}
 
-		msg := convertMessageBatch(nmsg)
-		return service.MessageBatch{msg}, func(ctx context.Context, err error) error {
+		return service.MessageBatch{convertMessageBatch(nmsg)}, func(ctx context.Context, err error) error {
 			if err != nil {
-				nmsg.Ack()
+				return nmsg.Nak()
 			}
-			return nil
+			return nmsg.Ack()
 		}, nil
 	}
 
-	msgs, err := natsSub.FetchBatch(10, nats.Context(ctx))
+	msgs, err := natsSub.FetchBatch(1000, nats.Context(ctx))
+	msgs.Error()
+
 	if err != nil {
 		if errors.Is(err, nats.ErrTimeout) || errors.Is(err, context.DeadlineExceeded) {
 			// NATS enforces its own context that might time out faster than the original context
@@ -379,16 +376,21 @@ func (j *jetStreamReader) ReadBatch(ctx context.Context) (service.MessageBatch, 
 	var benthosBatch []*service.Message
 
 	for m := range msgs.Messages() {
-		msg := convertMessageBatch(m)
+		msg := convertMessageBatch(m).
+			WithContext(ctx)
 		benthosBatch = append(benthosBatch, msg)
 	}
 
 	return benthosBatch, func(ctx context.Context, err error) error {
 		if err != nil {
 			for _, v := range batch {
-				v.Ack()
+				v.Nak()
 			}
+			return nil
+		}
 
+		for _, v := range batch {
+			v.Ack()
 		}
 		return nil
 	}, nil
@@ -429,33 +431,4 @@ func convertMessageBatch(m *nats.Msg) *service.Message {
 	}
 
 	return msg
-}
-
-func convertMessage(m *nats.Msg) (*service.Message, service.AckFunc, error) {
-	msg := service.NewMessage(m.Data)
-	msg.MetaSet("nats_subject", m.Subject)
-
-	metadata, err := m.Metadata()
-	if err == nil {
-		msg.MetaSet("nats_sequence_stream", strconv.Itoa(int(metadata.Sequence.Stream)))
-		msg.MetaSet("nats_sequence_consumer", strconv.Itoa(int(metadata.Sequence.Consumer)))
-		msg.MetaSet("nats_num_delivered", strconv.Itoa(int(metadata.NumDelivered)))
-		msg.MetaSet("nats_num_pending", strconv.Itoa(int(metadata.NumPending)))
-		msg.MetaSet("nats_domain", metadata.Domain)
-		msg.MetaSet("nats_timestamp_unix_nano", strconv.Itoa(int(metadata.Timestamp.UnixNano())))
-	}
-
-	for k := range m.Header {
-		v := m.Header.Get(k)
-		if v != "" {
-			msg.MetaSet(k, v)
-		}
-	}
-
-	return msg, func(ctx context.Context, res error) error {
-		if res == nil {
-			return m.Ack()
-		}
-		return m.Nak()
-	}, nil
 }
