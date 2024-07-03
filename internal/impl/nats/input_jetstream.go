@@ -357,9 +357,9 @@ func (j *jetStreamReader) ReadBatch(ctx context.Context) (service.MessageBatch, 
 		}, nil
 	}
 
-	var buf = make([]*service.Message, 1000)
+	var buf = make([]*service.Message, 10)
 	for {
-		msgs, err := natsSub.Fetch(1000, nats.Context(ctx))
+		msgs, err := natsSub.Fetch(1, nats.Context(ctx), nats.MaxWait(500*time.Millisecond))
 		if err != nil {
 			if errors.Is(err, nats.ErrTimeout) || errors.Is(err, context.DeadlineExceeded) {
 				// NATS enforces its own context that might time out faster than the original context

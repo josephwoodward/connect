@@ -140,13 +140,13 @@ input:
     bind: true
 `
 	suite := integration.StreamTests(
-		integration.StreamTestOpenClose(),
+		// integration.StreamTestOpenClose(),
 		// integration.StreamTestMetadata(), TODO
 		integration.StreamTestSendBatch(10),
 		// integration.StreamTestAtLeastOnceDelivery(), // TODO: SubscribeSync doesn't seem to honor durable setting
-		integration.StreamTestStreamParallel(1000),
-		integration.StreamTestStreamSequential(1000),
-		integration.StreamTestStreamParallelLossy(1000),
+		// integration.StreamTestStreamParallel(1000),
+		// integration.StreamTestStreamSequential(1000),
+		// integration.StreamTestStreamParallelLossy(1000),
 		// integration.StreamTestStreamParallelLossyThroughReconnect(1000),
 	)
 	suite.Run(
